@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev
+  labels:
+    environment: dev
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-admin
+  namespace: dev
+  labels:
+    app: web-admin
+    environment: dev
+spec:
+  type: ClusterIP
+  selector:
+    app: web-admin
+    environment: dev
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-admin
+  namespace: dev
+  labels:
+    app: web-admin
+    environment: dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web-admin
+      environment: dev
+  template:
+    metadata:
+      labels:
+        app: web-admin
+        environment: dev
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: docker-hub-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: web-admin
+          image: docker.io/anikolaevdo/web-admin:dev
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ADDR
+              value: ":8080"
+            - name: REDIS_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-dev-env
+                  key: REDIS_ADDR
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-dev-env
+                  key: REDIS_PASSWORD
+            - name: SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-dev-env
+                  key: SESSION_KEY
+            - name: USERS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-dev-env
+                  key: USERS_URL
+            - name: ANALYTICS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-dev-env
+                  key: ANALYTICS_URL
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: 300m
+              memory: 128Mi
+              ephemeral-storage: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true

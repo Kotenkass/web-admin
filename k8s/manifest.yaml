@@ -1,0 +1,103 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-admin
+  labels:
+    app: web-admin
+spec:
+  type: ClusterIP
+  selector:
+    app: web-admin
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-admin
+  labels:
+    app: web-admin
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-admin
+  template:
+    metadata:
+      labels:
+        app: web-admin
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: docker-hub-pull-secret
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: web-admin
+          image: docker.io/anikolaevdo/web-admin:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ADDR
+              value: ":8080"
+            - name: REDIS_ADDR
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-env
+                  key: REDIS_ADDR
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-env
+                  key: REDIS_PASSWORD
+            - name: SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-env
+                  key: SESSION_KEY
+            - name: USERS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-env
+                  key: USERS_URL
+            - name: ANALYTICS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: web-admin-env
+                  key: ANALYTICS_URL
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+              ephemeral-storage: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
