@@ -211,7 +211,7 @@ func (a *App) dashboard(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid session"})
 	}
 	if !ok {
-		return c.Redirect(http.StatusSeeOther, "/")
+		return c.String(http.StatusUnauthorized, "Unauthorized: open cabinet from Telegram link")
 	}
 
 	profile := templ.Profile{ChatID: chatID}
