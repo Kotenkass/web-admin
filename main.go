@@ -179,30 +179,19 @@ func (a *App) consumeToken(c echo.Context) error {
 	var chatID int64
 	if err := a.redis.Get(ctx, key).Scan(&chatID); err != nil {
 		if errors.Is(err, redis.Nil) {
-			return c.Redirect(http.StatusSeeOther, "/")
+			return c.String(http.StatusGone, "Cabinet link has already been used. Open it again from Telegram.")
 		}
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "redis unavailable"})
 	}
+
 	if err := a.redis.Del(ctx, key).Err(); err != nil {
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "redis unavailable"})
 	}
 
-	cookieValue, err := signSession(fmt.Sprint(chatID), a.sessionKey)
-	if err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "failed to sign session"})
-	}
-
-	c.SetCookie(&http.Cookie{
-		Name:     "session",
-		Value:    cookieValue,
-		Path:     "/",
-		MaxAge:   int(sessionTTL.Seconds()),
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteLaxMode,
-	})
+	setSessionCookie(c, fmt.Sprint(chatID), a.sessionKey)
 	a.metrics.sessionCreated.Inc()
-	return c.Redirect(http.StatusSeeOther, "/")
+	c.Response().Header().Add("Cache-Control", "no-store")
+	return c.Redirect(http.StatusTemporaryRedirect, "/")
 }
 
 func (a *App) dashboard(c echo.Context) error {
@@ -211,7 +200,7 @@ func (a *App) dashboard(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid session"})
 	}
 	if !ok {
-		return c.String(http.StatusUnauthorized, "Unauthorized: open cabinet from Telegram link")
+		return c.String(http.StatusUnauthorized, "Unauthorized")
 	}
 
 	profile := templ.Profile{ChatID: chatID}
@@ -314,6 +303,26 @@ func tokenKey(token string) string {
 	return "token:" + token
 }
 
+func sidKey(sid string) string {
+	return "session:" + sid
+}
+
+func setSessionCookie(c echo.Context, value string, key []byte) {
+	cookieValue, err := signSession(value, key)
+	if err != nil {
+		return
+	}
+	c.SetCookie(&http.Cookie{
+		Name:     "session",
+		Value:    cookieValue,
+		Path:     "/",
+		MaxAge:   int(sessionTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
 func signSession(value string, key []byte) (string, error) {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(value))
@@ -346,6 +355,20 @@ func verifySessionCookie(c echo.Context, key []byte) (int64, bool, error) {
 
 	chatID, err := strconv.ParseInt(string(rawValue), 10, 64)
 	if err != nil || chatID == 0 {
+		return 0, false, nil
+	}
+	return chatID, true, nil
+}
+
+func verifySessionID(ctx context.Context, rdb *redis.Client, sid string) (int64, bool, error) {
+	var chatID int64
+	if err := rdb.Get(ctx, sidKey(sid)).Scan(&chatID); err != nil {
+		if errors.Is(err, redis.Nil) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if chatID == 0 {
 		return 0, false, nil
 	}
 	return chatID, true, nil

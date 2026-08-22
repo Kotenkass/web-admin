@@ -51,9 +51,9 @@ jobs:
     env:
       MANIFEST_PATH: k8s/manifest.yaml
       KUBECONFIG: /tmp/kubeconfig
-      SESSION_KEY: ${{ secrets.SESSION_KEY }}
-      USERS_URL: ${{ secrets.USERS_URL }}
-      ANALYTICS_URL: ${{ secrets.ANALYTICS_URL }}
+      SESSION_KEY: ${{ vars.SESSION_KEY }}
+      USERS_URL: ${{ vars.USERS_URL }}
+      ANALYTICS_URL: ${{ vars.ANALYTICS_URL }}
 
     steps:
       - name: Checkout code
@@ -71,11 +71,11 @@ jobs:
 
       - name: Create or update web-admin environment Secret
         env:
-          REDIS_ADDR: ${{ secrets.REDIS_ADDR }}
-          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
-          SESSION_KEY: ${{ secrets.SESSION_KEY }}
-          USERS_URL: ${{ secrets.USERS_URL }}
-          ANALYTICS_URL: ${{ secrets.ANALYTICS_URL }}
+          REDIS_ADDR: ${{ vars.REDIS_ADDR }}
+          REDIS_PASSWORD: ${{ vars.REDIS_PASSWORD }}
+          SESSION_KEY: ${{ vars.SESSION_KEY }}
+          USERS_URL: ${{ vars.USERS_URL }}
+          ANALYTICS_URL: ${{ vars.ANALYTICS_URL }}
         run: |
           kubectl --kubeconfig "$KUBECONFIG" create secret generic web-admin-env \
             --from-literal=REDIS_ADDR="$REDIS_ADDR" \

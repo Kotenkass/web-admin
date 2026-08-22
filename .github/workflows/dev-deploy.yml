@@ -16,10 +16,10 @@ jobs:
 
     env:
       IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/web-admin
-      IMAGE_TAG: ${{ vars.IMAGE_TAG }}
-      NAMESPACE: ${{ vars.NAMESPACE }}
-      KUBECONFIG: ${{ vars.KUBECONFIG_PATH }}
-      MANIFEST_PATH: ${{ vars.MANIFEST_PATH }}
+      IMAGE_TAG: latest
+      NAMESPACE: dev
+      KUBECONFIG: /tmp/kubeconfig
+      MANIFEST_PATH: k8s/manifest-dev.yaml
       REDIS_ADDR: ${{ vars.REDIS_ADDR }}
       REDIS_PASSWORD: ""
       SESSION_KEY: ${{ vars.SESSION_KEY }}
