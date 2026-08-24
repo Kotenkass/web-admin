@@ -58,17 +58,18 @@ type App struct {
 }
 
 type metrics struct {
-	tokenRequests    prometheus.Counter
-	tokenErrors      prometheus.Counter
-	tokenConsumed    prometheus.Counter
-	httpsRejected    prometheus.Counter
-	internalRejected prometheus.Counter
-	sessionCreated   prometheus.Counter
-	sessionMissing   prometheus.Counter
-	sessionInvalid   prometheus.Counter
-	profileCalls     prometheus.Counter
-	analyticsCalls   prometheus.Counter
-	upstreamErrors   prometheus.Counter
+	tokenRequests       prometheus.Counter
+	tokenErrors         prometheus.Counter
+	tokenConsumed       prometheus.Counter
+	telegramPreviewSkip prometheus.Counter
+	httpsRejected       prometheus.Counter
+	internalRejected    prometheus.Counter
+	sessionCreated      prometheus.Counter
+	sessionMissing      prometheus.Counter
+	sessionInvalid      prometheus.Counter
+	profileCalls        prometheus.Counter
+	analyticsCalls      prometheus.Counter
+	upstreamErrors      prometheus.Counter
 }
 
 type upstreamClient struct {
@@ -194,6 +195,12 @@ func (a *App) createToken(c echo.Context) error {
 func (a *App) consumeToken(c echo.Context) error {
 	token := c.Param("token")
 	tokenDigest := tokenHash(token)
+	if isTelegramPreviewRequest(c.Request()) {
+		a.metrics.telegramPreviewSkip.Inc()
+		log.Printf("telegram preview skipped: token_hash=%s remote=%s client=%s user_agent=%q", tokenDigest, clientIP(c.Request()), peerIP(c.Request()), c.Request().UserAgent())
+		return c.String(http.StatusAccepted, "Telegram preview detected. Open the link in your browser.")
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request().Context(), upstreamTimeout)
 	defer cancel()
 
@@ -430,6 +437,10 @@ func newMetrics() *metrics {
 			Name: "web_admin_token_consumed_total",
 			Help: "Total cabinet tokens consumed.",
 		}),
+		telegramPreviewSkip: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "web_admin_telegram_preview_skipped_total",
+			Help: "Total Telegram preview requests skipped before consuming cabinet tokens.",
+		}),
 		httpsRejected: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "web_admin_https_rejected_total",
 			Help: "Total requests rejected because HTTPS was not detected.",
@@ -470,6 +481,7 @@ func (m *metrics) mustRegister() {
 		m.tokenRequests,
 		m.tokenErrors,
 		m.tokenConsumed,
+		m.telegramPreviewSkip,
 		m.httpsRejected,
 		m.internalRejected,
 		m.sessionCreated,
@@ -595,6 +607,20 @@ func forwardedProto(r *http.Request) (string, bool) {
 		proto = proto[:idx]
 	}
 	return strings.TrimSpace(proto), true
+}
+
+func isTelegramPreviewRequest(r *http.Request) bool {
+	userAgent := r.UserAgent()
+	if strings.Contains(userAgent, "TelegramBot") {
+		return true
+	}
+	if strings.Contains(userAgent, "Telegram") && strings.Contains(userAgent, "preview") {
+		return true
+	}
+	if strings.Contains(userAgent, "AppleWebKit") && strings.Contains(userAgent, "Chrome") && strings.Contains(userAgent, "Safari") {
+		return false
+	}
+	return false
 }
 
 func jsonHTTPError(err error, c echo.Context) {
