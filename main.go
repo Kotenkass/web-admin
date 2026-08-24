@@ -33,6 +33,8 @@ const (
 	tokenTTL        = 15 * time.Minute
 	sessionTTL      = time.Hour
 	upstreamTimeout = 3 * time.Second
+
+	headerForwardedProto = "X-Forwarded-Proto"
 )
 
 type Config struct {
@@ -223,7 +225,7 @@ func (a *App) consumeToken(c echo.Context) error {
 	setSessionCookie(c, fmt.Sprint(chatID), a.sessionKey)
 	a.metrics.tokenConsumed.Inc()
 	a.metrics.sessionCreated.Inc()
-	log.Printf("consume token ok: token_hash=%s chat_id=%d remote=%s client=%s proto=%s forwarded_proto=%s", tokenDigest, chatID, clientIP(c.Request()), peerIP(c.Request()), requestProto(c.Request()), c.Request().Header.Get("X-Forwarded-Proto"))
+	log.Printf("consume token ok: token_hash=%s chat_id=%d remote=%s client=%s proto=%s forwarded_proto=%s", tokenDigest, chatID, clientIP(c.Request()), peerIP(c.Request()), requestProto(c.Request()), c.Request().Header.Get(headerForwardedProto))
 	c.Response().Header().Add("Cache-Control", "no-store")
 	return c.Redirect(http.StatusTemporaryRedirect, "/")
 }
@@ -589,7 +591,7 @@ func isPrivateIP(value string) bool {
 }
 
 func requestProto(r *http.Request) string {
-	if proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); proto != "" {
+	if proto := strings.TrimSpace(r.Header.Get(headerForwardedProto)); proto != "" {
 		return proto
 	}
 	if r.TLS != nil {
@@ -599,7 +601,7 @@ func requestProto(r *http.Request) string {
 }
 
 func forwardedProto(r *http.Request) (string, bool) {
-	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	proto := strings.TrimSpace(r.Header.Get(headerForwardedProto))
 	if proto == "" {
 		return "", false
 	}
