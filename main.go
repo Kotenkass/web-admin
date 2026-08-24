@@ -7,11 +7,14 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -33,31 +36,39 @@ const (
 )
 
 type Config struct {
-	Addr          string
-	RedisAddr     string
-	RedisPassword string
-	SessionKey    string
-	UsersURL      string
-	AnalyticsURL  string
+	Addr               string
+	RedisAddr          string
+	RedisPassword      string
+	SessionKey         string
+	SessionKeyPrevious string
+	UsersURL           string
+	AnalyticsURL       string
 }
 
 type App struct {
-	cfg         Config
-	redis       *redis.Client
-	sessionKey  []byte
-	usersClient *upstreamClient
-	analytics   *upstreamClient
-	breaker     *gobreaker.CircuitBreaker
-	metrics     *metrics
+	cfg              Config
+	redis            *redis.Client
+	sessionKey       []byte
+	sessionKeyPrev   []byte
+	usersClient      *upstreamClient
+	analytics        *upstreamClient
+	usersBreaker     *gobreaker.CircuitBreaker
+	analyticsBreaker *gobreaker.CircuitBreaker
+	metrics          *metrics
 }
 
 type metrics struct {
-	tokenRequests  prometheus.Counter
-	tokenErrors    prometheus.Counter
-	sessionCreated prometheus.Counter
-	profileCalls   prometheus.Counter
-	analyticsCalls prometheus.Counter
-	upstreamErrors prometheus.Counter
+	tokenRequests    prometheus.Counter
+	tokenErrors      prometheus.Counter
+	tokenConsumed    prometheus.Counter
+	httpsRejected    prometheus.Counter
+	internalRejected prometheus.Counter
+	sessionCreated   prometheus.Counter
+	sessionMissing   prometheus.Counter
+	sessionInvalid   prometheus.Counter
+	profileCalls     prometheus.Counter
+	analyticsCalls   prometheus.Counter
+	upstreamErrors   prometheus.Counter
 }
 
 type upstreamClient struct {
@@ -77,19 +88,25 @@ type tokenResponse struct {
 
 func main() {
 	cfg := Config{
-		Addr:          env("ADDR", ":8080"),
-		RedisAddr:     env("REDIS_ADDR", "localhost:6379"),
-		RedisPassword: env("REDIS_PASSWORD", ""),
-		SessionKey:    env("SESSION_KEY", ""),
-		UsersURL:      strings.TrimRight(env("USERS_URL", "http://users-service:8080"), "/"),
-		AnalyticsURL:  strings.TrimRight(env("ANALYTICS_URL", "http://analytics-service:8080"), "/"),
+		Addr:               env("ADDR", ":8080"),
+		RedisAddr:          env("REDIS_ADDR", "localhost:6379"),
+		RedisPassword:      env("REDIS_PASSWORD", ""),
+		SessionKey:         env("SESSION_KEY", ""),
+		SessionKeyPrevious: env("SESSION_KEY_PREVIOUS", ""),
+		UsersURL:           strings.TrimRight(env("USERS_URL", "http://users-service:8080"), "/"),
+		AnalyticsURL:       strings.TrimRight(env("ANALYTICS_URL", "http://analytics-service:8080"), "/"),
 	}
 
 	if cfg.SessionKey == "" {
-		cfg.SessionKey = "dev-session-key-change-me"
+		log.Fatal("SESSION_KEY is required")
 	}
 
 	sessionKey := sha256.Sum256([]byte(cfg.SessionKey))
+	var sessionKeyPrev []byte
+	if cfg.SessionKeyPrevious != "" {
+		prev := sha256.Sum256([]byte(cfg.SessionKeyPrevious))
+		sessionKeyPrev = prev[:]
+	}
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.RedisAddr,
@@ -97,13 +114,15 @@ func main() {
 	})
 
 	app := &App{
-		cfg:         cfg,
-		redis:       rdb,
-		sessionKey:  sessionKey[:],
-		usersClient: newUpstreamClient("users", cfg.UsersURL),
-		analytics:   newUpstreamClient("analytics", cfg.AnalyticsURL),
-		breaker:     gobreaker.NewCircuitBreaker(gobreaker.Settings{Name: "upstreams", Timeout: 10 * time.Second}),
-		metrics:     newMetrics(),
+		cfg:              cfg,
+		redis:            rdb,
+		sessionKey:       sessionKey[:],
+		sessionKeyPrev:   sessionKeyPrev,
+		usersClient:      newUpstreamClient("users", cfg.UsersURL),
+		analytics:        newUpstreamClient("analytics", cfg.AnalyticsURL),
+		usersBreaker:     gobreaker.NewCircuitBreaker(gobreaker.Settings{Name: "users", Timeout: 10 * time.Second}),
+		analyticsBreaker: gobreaker.NewCircuitBreaker(gobreaker.Settings{Name: "analytics", Timeout: 10 * time.Second}),
+		metrics:          newMetrics(),
 	}
 	app.metrics.mustRegister()
 
@@ -112,6 +131,8 @@ func main() {
 	e.HTTPErrorHandler = jsonHTTPError
 	e.Use(middleware.Recover())
 	e.Use(middleware.RequestID())
+	e.Use(requireInternalNetwork(app))
+	e.Use(requireForwardedProtoHTTPS(app))
 	e.Use(middleware.LoggerWithConfig(middleware.LoggerConfig{Format: "${time_rfc3339} ${status} ${method} ${uri} ${latency}\n"}))
 
 	e.GET("/healthz", healthz(rdb))
@@ -172,6 +193,7 @@ func (a *App) createToken(c echo.Context) error {
 
 func (a *App) consumeToken(c echo.Context) error {
 	token := c.Param("token")
+	tokenDigest := tokenHash(token)
 	ctx, cancel := context.WithTimeout(c.Request().Context(), upstreamTimeout)
 	defer cancel()
 
@@ -179,27 +201,36 @@ func (a *App) consumeToken(c echo.Context) error {
 	var chatID int64
 	if err := a.redis.Get(ctx, key).Scan(&chatID); err != nil {
 		if errors.Is(err, redis.Nil) {
+			log.Printf("consume token failed: token_hash=%s reason=missing_or_expired remote=%s client=%s user_agent=%q", tokenDigest, clientIP(c.Request()), peerIP(c.Request()), c.Request().UserAgent())
 			return c.String(http.StatusGone, "Cabinet link has already been used. Open it again from Telegram.")
 		}
+		log.Printf("consume token redis error: token_hash=%s error=%q remote=%s client=%s", tokenDigest, err.Error(), clientIP(c.Request()), peerIP(c.Request()))
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "redis unavailable"})
 	}
 
 	if err := a.redis.Del(ctx, key).Err(); err != nil {
+		log.Printf("consume token delete failed: token_hash=%s chat_id=%d error=%q", tokenDigest, chatID, err.Error())
 		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "redis unavailable"})
 	}
 
 	setSessionCookie(c, fmt.Sprint(chatID), a.sessionKey)
+	a.metrics.tokenConsumed.Inc()
 	a.metrics.sessionCreated.Inc()
+	log.Printf("consume token ok: token_hash=%s chat_id=%d remote=%s client=%s proto=%s forwarded_proto=%s", tokenDigest, chatID, clientIP(c.Request()), peerIP(c.Request()), requestProto(c.Request()), c.Request().Header.Get("X-Forwarded-Proto"))
 	c.Response().Header().Add("Cache-Control", "no-store")
 	return c.Redirect(http.StatusTemporaryRedirect, "/")
 }
 
 func (a *App) dashboard(c echo.Context) error {
-	chatID, ok, err := verifySessionCookie(c, a.sessionKey)
+	chatID, ok, err := verifySessionCookie(c, a.sessionKey, a.sessionKeyPrev)
 	if err != nil {
+		a.metrics.sessionInvalid.Inc()
+		log.Printf("session invalid: remote=%s client=%s user_agent=%q error=%q", clientIP(c.Request()), peerIP(c.Request()), c.Request().UserAgent(), err.Error())
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid session"})
 	}
 	if !ok {
+		a.metrics.sessionMissing.Inc()
+		log.Printf("session missing_or_invalid: remote=%s client=%s user_agent=%q", clientIP(c.Request()), peerIP(c.Request()), c.Request().UserAgent())
 		return c.String(http.StatusUnauthorized, "Unauthorized")
 	}
 
@@ -234,36 +265,36 @@ func (a *App) dashboard(c echo.Context) error {
 func (a *App) getProfile(ctx context.Context, chatID int64) (templ.Profile, error) {
 	a.metrics.profileCalls.Inc()
 	var profile templ.Profile
-	err := a.callUpstream(ctx, fmt.Sprintf("%s/users/%d", a.cfg.UsersURL, chatID), &profile)
+	err := a.callUpstream(ctx, a.usersClient, a.usersBreaker, fmt.Sprintf("%s/users/%d", a.cfg.UsersURL, chatID), &profile)
 	return profile, err
 }
 
 func (a *App) getDailyAnswers(ctx context.Context, chatID int64) ([]templ.DailyAnswer, error) {
 	a.metrics.analyticsCalls.Inc()
 	var answers []templ.DailyAnswer
-	err := a.callUpstream(ctx, fmt.Sprintf("%s/analytics/chat/%d/daily?days=30", a.cfg.AnalyticsURL, chatID), &answers)
+	err := a.callUpstream(ctx, a.analytics, a.analyticsBreaker, fmt.Sprintf("%s/analytics/chat/%d/daily?days=30", a.cfg.AnalyticsURL, chatID), &answers)
 	return answers, err
 }
 
-func (a *App) callUpstream(ctx context.Context, endpoint string, out any) error {
-	_, err := a.breaker.Execute(func() (any, error) {
+func (a *App) callUpstream(ctx context.Context, client *upstreamClient, breaker *gobreaker.CircuitBreaker, endpoint string, out any) error {
+	_, err := breaker.Execute(func() (any, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, err
 		}
 		req.Header.Set("Accept", "application/json")
 
-		resp, err := a.usersClient.client.Do(req)
+		resp, err := client.client.Do(req)
 		if err != nil {
 			return nil, err
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 500 {
-			return nil, fmt.Errorf("%s returned %d", a.usersClient.name, resp.StatusCode)
+			return nil, fmt.Errorf("%s returned %d", client.name, resp.StatusCode)
 		}
 		if resp.StatusCode >= 400 {
-			return nil, fmt.Errorf("%s returned %d", a.usersClient.name, resp.StatusCode)
+			return nil, fmt.Errorf("%s returned %d", client.name, resp.StatusCode)
 		}
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 			return nil, err
@@ -299,6 +330,11 @@ func randomBase64URL(n int) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:8])
+}
+
 func tokenKey(token string) string {
 	return "token:" + token
 }
@@ -330,7 +366,7 @@ func signSession(value string, key []byte) (string, error) {
 	return base64.RawURLEncoding.EncodeToString([]byte(value)) + "." + sig, nil
 }
 
-func verifySessionCookie(c echo.Context, key []byte) (int64, bool, error) {
+func verifySessionCookie(c echo.Context, keys ...[]byte) (int64, bool, error) {
 	cookie, err := c.Cookie("session")
 	if err != nil {
 		return 0, false, nil
@@ -345,19 +381,25 @@ func verifySessionCookie(c echo.Context, key []byte) (int64, bool, error) {
 		return 0, false, err
 	}
 
-	expected, err := signSession(string(rawValue), key)
-	if err != nil {
-		return 0, false, err
-	}
-	if subtle.ConstantTimeCompare([]byte(expected), []byte(cookie.Value)) != 1 {
-		return 0, false, nil
-	}
+	for _, key := range keys {
+		if len(key) == 0 {
+			continue
+		}
+		expected, err := signSession(string(rawValue), key)
+		if err != nil {
+			return 0, false, err
+		}
+		if subtle.ConstantTimeCompare([]byte(expected), []byte(cookie.Value)) != 1 {
+			continue
+		}
 
-	chatID, err := strconv.ParseInt(string(rawValue), 10, 64)
-	if err != nil || chatID == 0 {
-		return 0, false, nil
+		chatID, err := strconv.ParseInt(string(rawValue), 10, 64)
+		if err != nil || chatID == 0 {
+			return 0, false, nil
+		}
+		return chatID, true, nil
 	}
-	return chatID, true, nil
+	return 0, false, nil
 }
 
 func verifySessionID(ctx context.Context, rdb *redis.Client, sid string) (int64, bool, error) {
@@ -384,9 +426,29 @@ func newMetrics() *metrics {
 			Name: "web_admin_token_errors_total",
 			Help: "Total token creation failures.",
 		}),
+		tokenConsumed: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "web_admin_token_consumed_total",
+			Help: "Total cabinet tokens consumed.",
+		}),
+		httpsRejected: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "web_admin_https_rejected_total",
+			Help: "Total requests rejected because HTTPS was not detected.",
+		}),
+		internalRejected: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "web_admin_internal_rejected_total",
+			Help: "Total /internal/* requests rejected by network policy.",
+		}),
 		sessionCreated: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "web_admin_session_created_total",
 			Help: "Total session cookies created.",
+		}),
+		sessionMissing: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "web_admin_session_missing_total",
+			Help: "Total dashboard requests without a valid session cookie.",
+		}),
+		sessionInvalid: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "web_admin_session_invalid_total",
+			Help: "Total dashboard requests with malformed session cookies.",
 		}),
 		profileCalls: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "web_admin_profile_calls_total",
@@ -407,7 +469,12 @@ func (m *metrics) mustRegister() {
 	prometheus.MustRegister(
 		m.tokenRequests,
 		m.tokenErrors,
+		m.tokenConsumed,
+		m.httpsRejected,
+		m.internalRejected,
 		m.sessionCreated,
+		m.sessionMissing,
+		m.sessionInvalid,
 		m.profileCalls,
 		m.analyticsCalls,
 		m.upstreamErrors,
@@ -419,6 +486,115 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func requireInternalNetwork(app *App) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			if !strings.HasPrefix(c.Request().URL.Path, "/internal/") {
+				return next(c)
+			}
+			if c.Request().Header.Get("X-Forwarded-For") != "" || c.Request().Header.Get("X-Forwarded-Host") != "" {
+				app.metrics.internalRejected.Inc()
+				log.Printf("internal request rejected: path=%s remote=%s client=%s reason=forwarded", c.Request().URL.Path, peerIP(c.Request()), clientIP(c.Request()))
+				return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+			}
+			if !isPrivateIP(peerIP(c.Request())) {
+				app.metrics.internalRejected.Inc()
+				log.Printf("internal request rejected: path=%s remote=%s client=%s reason=not_private", c.Request().URL.Path, peerIP(c.Request()), clientIP(c.Request()))
+				return c.JSON(http.StatusForbidden, map[string]string{"error": "forbidden"})
+			}
+			return next(c)
+		}
+	}
+}
+
+func requireForwardedProtoHTTPS(app *App) echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c echo.Context) error {
+			path := c.Request().URL.Path
+			if path == "/healthz" || path == "/metrics" || strings.HasPrefix(path, "/internal/") {
+				return next(c)
+			}
+
+			proto, ok := forwardedProto(c.Request())
+			if !ok {
+				proto = requestProto(c.Request())
+			}
+			if proto != "" && !strings.EqualFold(proto, "https") {
+				app.metrics.httpsRejected.Inc()
+				log.Printf("non-https request rejected: path=%s proto=%s remote=%s client=%s", path, proto, peerIP(c.Request()), clientIP(c.Request()))
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "https required"})
+			}
+			if proto == "https" {
+				c.Response().Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+			}
+			return next(c)
+		}
+	}
+}
+
+func clientIP(r *http.Request) string {
+	if isPrivateIP(peerIP(r)) {
+		if forwarded := firstXForwardedFor(r); forwarded != "" {
+			return forwarded
+		}
+	}
+	return peerIP(r)
+}
+
+func peerIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return strings.Trim(host, "[]")
+}
+
+func firstXForwardedFor(r *http.Request) string {
+	for _, part := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+		ip := strings.TrimSpace(part)
+		if ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+func isPrivateIP(value string) bool {
+	value = strings.Trim(value, "[]")
+	if value == "" {
+		return false
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return false
+	}
+	if addr.Is4In6() {
+		addr = addr.Unmap()
+	}
+	return addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast()
+}
+
+func requestProto(r *http.Request) string {
+	if proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); proto != "" {
+		return proto
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func forwardedProto(r *http.Request) (string, bool) {
+	proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto"))
+	if proto == "" {
+		return "", false
+	}
+	if idx := strings.Index(proto, ","); idx >= 0 {
+		proto = proto[:idx]
+	}
+	return strings.TrimSpace(proto), true
 }
 
 func jsonHTTPError(err error, c echo.Context) {
