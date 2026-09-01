@@ -1,0 +1,28 @@
+# Git
+.git/
+
+# Go build/test artifacts
+/bin/
+/dist/
+/vendor/
+*.test
+*.out
+coverage.out
+
+# Local build output
+/web-admin
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env
+.env
+.env.*
+!.env.example
