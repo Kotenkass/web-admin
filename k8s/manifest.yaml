@@ -40,7 +40,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: web-admin
-          image: docker.io/anikolaevdo/web-admin:latest
+          image: docker.io/anikolaevdo/web-admin:release
           imagePullPolicy: Always
           ports:
             - name: http
