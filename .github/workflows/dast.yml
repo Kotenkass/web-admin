@@ -14,6 +14,8 @@ on:
         description: 'Prefix for report filenames'
         required: true
         default: 'zap-report-manual'
+  repository_dispatch:
+    types: [zap-baseline]
 
 permissions:
   contents: read
@@ -28,8 +30,8 @@ jobs:
       actions: read
 
     env:
-      ZAP_TARGET: ${{ github.event.inputs.target || 'https://admin.sparktonapp.ru' }}
-      REPORT_PREFIX: ${{ github.event.inputs.report_prefix || 'zap-report' }}
+      ZAP_TARGET: ${{ github.event.inputs.target || github.event.client_payload.target || 'https://admin.sparktonapp.ru' }}
+      REPORT_PREFIX: ${{ github.event.inputs.report_prefix || github.event.client_payload.report_prefix || 'zap-report' }}
 
     steps:
       - name: Checkout
