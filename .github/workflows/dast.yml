@@ -1,6 +1,9 @@
 name: DAST - OWASP ZAP baseline
 
 on:
+  push:
+    branches:
+      - task13
   schedule:
     # Run every Sunday at 03:00 UTC (dev environment is quiet).
     - cron: '0 3 * * 0'
