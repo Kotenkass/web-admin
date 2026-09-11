@@ -1,0 +1,86 @@
+name: DAST - OWASP ZAP baseline
+
+on:
+  push:
+    branches:
+      - task13
+  schedule:
+    # Run every Sunday at 03:00 UTC (dev environment is quiet).
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target URL for ZAP baseline scan'
+        required: true
+        default: 'https://admin.sparktonapp.ru'
+      report_prefix:
+        description: 'Prefix for report filenames'
+        required: true
+        default: 'zap-report-manual'
+  repository_dispatch:
+    types: [zap-baseline]
+
+permissions:
+  contents: read
+
+jobs:
+  dast:
+    name: OWASP ZAP baseline scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+
+    env:
+      ZAP_TARGET: ${{ github.event.inputs.target || github.event.client_payload.target || 'https://admin.sparktonapp.ru' }}
+      REPORT_PREFIX: ${{ github.event.inputs.report_prefix || github.event.client_payload.report_prefix || 'zap-report' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Pull OWASP ZAP stable image
+        run: docker pull zaproxy/zap-stable
+
+      - name: Run ZAP baseline scan
+        run: |
+          mkdir -p zap-reports
+          chmod 777 zap-reports
+          docker run --rm \
+            -v "$PWD/zap-reports:/zap/wrk:rw" \
+            -t zaproxy/zap-stable \
+            zap-baseline.py \
+              -t "$ZAP_TARGET" \
+              -J "${REPORT_PREFIX}.json" \
+              -r "${REPORT_PREFIX}.html" \
+              -w "${REPORT_PREFIX}.md" \
+              -m 5 \
+              --auto
+        continue-on-error: true
+
+      - name: Upload ZAP reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: "${{ env.REPORT_PREFIX }}-${{ github.run_id }}"
+          path: |
+            zap-reports/${{ env.REPORT_PREFIX }}.json
+            zap-reports/${{ env.REPORT_PREFIX }}.html
+            zap-reports/${{ env.REPORT_PREFIX }}.md
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Summarize alert counts
+        if: always()
+        run: |
+          echo "## ZAP baseline summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Target: $ZAP_TARGET" >> "$GITHUB_STEP_SUMMARY"
+          report="zap-reports/${REPORT_PREFIX}.json"
+          if [ -f "$report" ]; then
+            echo "\`\`\`json" >> "$GITHUB_STEP_SUMMARY"
+            jq '{site: [.site[0] | {alerts: [.alerts[] | {name: .name, riskcode: .riskcode, confidence: .confidence}]}]}' "$report" >> "$GITHUB_STEP_SUMMARY" || true
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No JSON report generated." >> "$GITHUB_STEP_SUMMARY"
+          fi
