@@ -46,6 +46,7 @@ jobs:
       - name: Run ZAP baseline scan
         run: |
           mkdir -p zap-reports
+          chmod 777 zap-reports
           docker run --rm \
             -v "$PWD/zap-reports:/zap/wrk:rw" \
             -t zaproxy/zap-stable \
